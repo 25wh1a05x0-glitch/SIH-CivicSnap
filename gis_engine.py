@@ -6,11 +6,38 @@ Handles:
 3. Historical Risk & Flooding Hotspot Index
 4. Departmental Auto-Routing Matrix & Field Engineer Assignment
 5. Weighted Priority Scoring Formula & SLA Timers
+
+PATCH NOTES (vs original):
+- Fixed engineer assignment: replaced Python's built-in `hash()` (randomized
+  per-process via PYTHONHASHSEED, so it is NOT stable across restarts or
+  across multiple worker processes) with a stable hash (`hashlib.md5`) plus
+  a round-robin counter, so the same ward+category no longer always pins to
+  one engineer forever while the rest of the pool sits idle.
+- `reverse_geocode` now checks the nearest ward's distance against a coverage
+  radius and returns an explicit "out of coverage" result instead of silently
+  assigning a real ward/zonal officer to a location that may be nowhere near it.
+- `route_ticket` now logs when a category falls back to the default department,
+  instead of silently mis-routing unknown categories.
+- Added a helper to render the SLA deadline in IST alongside UTC, since the
+  data will ultimately be read by municipal staff in Mumbai.
+- Landmark `urgency_weight` is now actually used (as a small modifier) in
+  criticality scoring instead of being dead data.
 """
 
+import hashlib
+import logging
 import math
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, List
 from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger("municipal_gis_engine")
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# Max distance (meters) from a ward center for a report to be considered
+# "in coverage." Beyond this, we don't trust the nearest-ward match.
+WARD_COVERAGE_RADIUS_M = 15000.0
+
 
 def haversine_distance_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0  # Earth's radius in meters
@@ -23,6 +50,14 @@ def haversine_distance_meters(lat1: float, lon1: float, lat2: float, lon2: float
         math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return R * c
+
+
+def stable_hash_index(key: str, modulus: int) -> int:
+    """Deterministic hash → index, stable across process restarts and workers
+    (unlike Python's built-in hash(), which is randomized per-process)."""
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return int(digest, 16) % modulus
+
 
 class MunicipalGISEngine:
     def __init__(self):
@@ -145,9 +180,17 @@ class MunicipalGISEngine:
             }
         }
 
+        # Round-robin counters, keyed by (department, ward_id), so repeated
+        # tickets from the same ward/department spread across the engineer
+        # pool instead of always landing on the same person.
+        self._assignment_counters: Dict[str, int] = {}
+
     def reverse_geocode(self, lat: float, lng: float) -> Dict[str, Any]:
         """
         Maps latitude & longitude to nearest Municipal Ward, Zone, and Landmarks.
+        Returns an explicit out-of-coverage result if the nearest ward is
+        further away than WARD_COVERAGE_RADIUS_M, rather than silently
+        assigning a real ward/zonal officer to a distant location.
         """
         # 1. Find closest ward
         closest_ward = self.wards[0]
@@ -157,6 +200,29 @@ class MunicipalGISEngine:
             if dist < min_ward_dist:
                 min_ward_dist = dist
                 closest_ward = ward
+
+        if min_ward_dist > WARD_COVERAGE_RADIUS_M:
+            return {
+                "in_coverage": False,
+                "ward_id": None,
+                "ward_name": None,
+                "zone": None,
+                "zonal_head": None,
+                "zonal_contact": None,
+                "nearest_landmark": None,
+                "distance_to_landmark_m": None,
+                "nearby_critical_features": [],
+                "base_historical_risk": 0.0,
+                "flood_vulnerability": None,
+                "pothole_vulnerability": None,
+                "nearest_ward_distance_m": round(min_ward_dist, 1),
+                "note": (
+                    f"Location is {round(min_ward_dist / 1000, 1)} km from the nearest "
+                    f"known ward ({closest_ward['ward_name']}), outside the "
+                    f"{WARD_COVERAGE_RADIUS_M / 1000:.0f} km coverage radius. "
+                    "Route for manual review before auto-assigning a ward officer."
+                ),
+            }
 
         # 2. Find closest landmarks
         nearest_landmark = None
@@ -174,10 +240,12 @@ class MunicipalGISEngine:
                 nearby_critical_features.append({
                     "name": lm["name"],
                     "type": lm["type"],
-                    "distance_meters": round(dist, 1)
+                    "distance_meters": round(dist, 1),
+                    "urgency_weight": lm.get("urgency_weight", 0),
                 })
 
         return {
+            "in_coverage": True,
             "ward_id": closest_ward["id"],
             "ward_name": closest_ward["ward_name"],
             "zone": closest_ward["zone"],
@@ -194,26 +262,34 @@ class MunicipalGISEngine:
     def calculate_location_criticality(self, nearby_features: List[Dict[str, Any]], distance_to_lm: float) -> float:
         """
         Evaluates proximity to schools, hospitals, highways, and flood choke points.
-        Returns a score from 15.0 to 100.0.
+        Returns a score from 15.0 to 100.0. Each feature's urgency_weight now
+        contributes a small modifier on top of the base distance-tier bump, so
+        e.g. Lilavati (95) counts for slightly more than Cooper (90) at the
+        same distance, instead of the weight being ignored entirely.
         """
-        score = 25.0 # Base street criticality
+        score = 25.0  # Base street criticality
 
         for feat in nearby_features:
             dist = feat["distance_meters"]
             f_type = feat.get("type", "")
+            weight_modifier = (feat.get("urgency_weight", 70) - 70) * 0.1  # small nudge, +/- a few points
 
+            base_bump = 0.0
             if f_type == "hospital":
-                if dist <= 200: score += 50
-                elif dist <= 400: score += 35
-                elif dist <= 600: score += 20
+                if dist <= 200: base_bump = 50
+                elif dist <= 400: base_bump = 35
+                elif dist <= 600: base_bump = 20
             elif f_type == "school":
-                if dist <= 200: score += 40
-                elif dist <= 400: score += 25
+                if dist <= 200: base_bump = 40
+                elif dist <= 400: base_bump = 25
             elif f_type in ["highway", "flood_point"]:
-                if dist <= 150: score += 45
-                elif dist <= 350: score += 30
+                if dist <= 150: base_bump = 45
+                elif dist <= 350: base_bump = 30
             elif f_type == "transit":
-                if dist <= 250: score += 30
+                if dist <= 250: base_bump = 30
+
+            if base_bump > 0:
+                score += base_bump + weight_modifier
 
         return min(100.0, max(15.0, score))
 
@@ -227,13 +303,14 @@ class MunicipalGISEngine:
     ) -> Dict[str, Any]:
         """
         Applies weighted priority formula:
-        Priority Score = (0.35 × AI damage) + (0.25 × citizen report count) + (0.20 × location criticality) + (0.20 × historical risk)
+        Priority Score = (0.35 x AI damage) + (0.25 x citizen report count) + (0.20 x location criticality) + (0.20 x historical risk)
         + NLP Urgency Bonus
+
+        Report-count scaling: count_score = report_count * 22 + 10, capped at 100
+        (i.e. 1 report -> 32, 2 -> 54, 3 -> 76, 4+ -> 98/100).
         """
-        # Scale report count: 1 report -> 25, 2 reports -> 50, 3 reports -> 75, 4+ reports -> 100
         count_score = min(100.0, report_count * 22.0 + 10.0)
 
-        # Weighted calculation
         raw_score = (
             (0.35 * ai_damage_severity) +
             (0.25 * count_score) +
@@ -241,7 +318,6 @@ class MunicipalGISEngine:
             (0.20 * historical_risk)
         )
 
-        # Add NLP bonus (scaled)
         final_score = min(100.0, max(10.0, raw_score + (nlp_urgency_bonus * 0.4)))
         rounded_score = round(final_score, 1)
 
@@ -279,23 +355,39 @@ class MunicipalGISEngine:
     def route_ticket(self, category: str, priority: str, ward_info: Dict[str, Any]) -> Dict[str, Any]:
         """
         Auto-routes ticket to municipal department and assigns field officer + SLA countdown.
+        Engineer assignment uses a stable hash seed (round-robin start point)
+        plus a per-(department, ward) counter, so repeated tickets spread
+        across the pool instead of always hitting the same one person.
         """
-        dept_info = self.departments.get(category, self.departments["pothole"])
+        dept_info = self.departments.get(category)
+        if dept_info is None:
+            logger.warning(
+                "Unknown category '%s' — falling back to default department (pothole/PWD).",
+                category,
+            )
+            dept_info = self.departments["pothole"]
+
         sla_hours = dept_info["sla_hours"].get(priority, 48)
-        
-        # Select assigned field engineer deterministically from pool based on ward
         pool = dept_info["engineer_pool"]
-        engineer_idx = abs(hash(ward_info.get("ward_id", "KW"))) % len(pool)
+        ward_id = ward_info.get("ward_id") or "UNASSIGNED"
+
+        counter_key = f"{dept_info['dept_name']}::{ward_id}"
+        seed = stable_hash_index(counter_key, len(pool))
+        turn = self._assignment_counters.get(counter_key, 0)
+        engineer_idx = (seed + turn) % len(pool)
+        self._assignment_counters[counter_key] = turn + 1
         assigned_engineer = pool[engineer_idx]
 
-        now = datetime.now(timezone.utc)
-        deadline = now + timedelta(hours=sla_hours)
+        now_utc = datetime.now(timezone.utc)
+        deadline_utc = now_utc + timedelta(hours=sla_hours)
+        deadline_ist = deadline_utc.astimezone(IST)
 
         return {
             "department": dept_info["dept_name"],
             "assigned_engineer": assigned_engineer,
             "sla_hours": sla_hours,
-            "sla_deadline": deadline.isoformat(),
+            "sla_deadline_utc": deadline_utc.isoformat(),
+            "sla_deadline_ist": deadline_ist.strftime("%Y-%m-%d %H:%M IST"),
             "zonal_office": ward_info.get("zone", "Municipal Zone"),
             "ward_name": ward_info.get("ward_name", "Municipal Ward")
         }
